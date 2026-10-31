@@ -10,6 +10,8 @@ Tampermonkey userscript for Amazon US order history. It reads every package page
 
 版本 1.1 新增本地物流工作台：可筛选和勾选包裹、复制单号或 TSV、导出 UTF-8 CSV，并把报单状态标记为“待报单”或“已报单（本地）”。该标记只保存在浏览器本地，不代表 BFMR、MOD 或任何平台已成功接收。
 
+工作台的“复制诊断报告”只输出脚本版本、选择器和数量统计，不包含订单号、物流号、商品、地址或登录信息；页面结构变化时可将该报告用于排查。
+
 ## Install
 
 1. Install Tampermonkey in your browser.

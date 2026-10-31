@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.1.0
+// @version      1.1.1
 // @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
@@ -18,6 +18,7 @@
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
   const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
+  const SCRIPT_VERSION = '1.1.1';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -204,15 +205,17 @@
     const button = document.getElementById(BUTTON_ID);
     button.disabled = true;
     button.textContent = '正在读取物流页…';
+    const links = packageLinks();
     const byTracking = new Map();
     let visited = 0;
+    let missingTrackingField = 0;
     const errors = [];
-    for (const link of packageLinks()) {
+    for (const link of links) {
       try {
         const doc = await fetchDocument(link.url);
         visited += 1;
         const tracking = trackingFromDeliveryCard(doc);
-        if (!tracking) continue;
+        if (!tracking) { missingTrackingField += 1; continue; }
         const orderResult = packageOrders(doc, link.fallbackOrder);
         const value = await resolveAmount(doc, orderResult.ids);
         const old = byTracking.get(tracking);
@@ -227,7 +230,13 @@
         errors.push(error?.message || '读取或解析失败');
       }
     }
-    showPanel([...byTracking.values()], { visited, errors });
+    showPanel([...byTracking.values()], {
+      candidateLinks: links.length,
+      visited,
+      missingTrackingField,
+      errors,
+      orderCards: findOrderCards().length
+    });
     button.disabled = false;
     button.textContent = '重新提取物流号';
   }
@@ -260,7 +269,19 @@
       const copyNumbers = make('button', '复制单号'); copyNumbers.onclick = () => copy(selectedRows().map(row => row.tracking).join('\n'));
       const copyTable = make('button', '复制 TSV'); copyTable.onclick = () => copy(selectedRows().map(row => `${row.tracking}\t${row.state === '已确认' ? `$${row.amount.toFixed(2)}` : '待识别'}\t${row.orders.join(',')}\t${row.orderConfidence}\t${row.submissionState}`).join('\n'));
       const exportCsv = make('button', '导出 CSV'); exportCsv.onclick = () => downloadCsv(selectedRows());
-      controls.append(filter, copyNumbers, copyTable, exportCsv); panel.append(controls);
+      const diagnostic = make('button', '复制诊断报告');
+      diagnostic.onclick = () => copy([
+        `Amazon Tracking Assistant ${SCRIPT_VERSION}`,
+        `页面路径: ${location.pathname}`,
+        `订单卡: ${summary.orderCards}`,
+        `候选物流链接: ${summary.candidateLinks}`,
+        `已读取物流页: ${summary.visited}`,
+        `识别物流号: ${rows.length}`,
+        `缺少 .pt-delivery-card-trackingId: ${summary.missingTrackingField}`,
+        `读取异常: ${summary.errors.length}`,
+        '数据策略: 仅从 .pt-delivery-card-trackingId 读取物流号；页面全文不用于推测订单关联。'
+      ].join('\n'));
+      controls.append(filter, copyNumbers, copyTable, exportCsv, diagnostic); panel.append(controls);
       const table = make('table'); Object.assign(table.style, { width: '100%', borderCollapse: 'collapse' });
       const head = make('thead'); const headRow = make('tr'); const all = document.createElement('input'); all.type = 'checkbox'; all.checked = visible.length > 0 && visible.every(row => selected.has(row.tracking));
       all.onchange = () => { visible.forEach(row => all.checked ? selected.add(row.tracking) : selected.delete(row.tracking)); render(); };
