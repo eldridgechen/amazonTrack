@@ -8,6 +8,8 @@ Tampermonkey userscript for Amazon US order history. It reads every package page
 
 `TBA...SEE` is normalized to the underlying `TBA...` number. Other text or URLs are never used to invent a tracking number. If product identity, quantity, or unit price cannot be confirmed, the value is **待识别**; an order total is never used as a substitute.
 
+版本 1.1 新增本地物流工作台：可筛选和勾选包裹、复制单号或 TSV、导出 UTF-8 CSV，并把报单状态标记为“待报单”或“已报单（本地）”。该标记只保存在浏览器本地，不代表 BFMR、MOD 或任何平台已成功接收。
+
 ## Install
 
 1. Install Tampermonkey in your browser.

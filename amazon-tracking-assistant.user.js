@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.0.0
-// @description  从 Amazon 物流详情页精确读取运单号，并保守汇总已确认属于包裹的商品金额。
+// @version      1.1.0
+// @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
 // @match        https://www.amazon.com/progress-tracker/*
@@ -17,6 +17,7 @@
 
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
+  const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -35,7 +36,8 @@
 
     const raw = text(field.textContent);
     const labelled = raw.match(/(?:tracking\s*(?:id|number|#)?|运单号|追踪号)\s*[:#-]\s*([^\s]+)/i);
-    return normalizeTracking(labelled ? labelled[1] : raw.split(':').slice(1).join(':'));
+    // 未带标签时仅采用该专用字段的完整文本，不能从链接、订单号或其他页面文字推测。
+    return normalizeTracking(labelled ? labelled[1] : raw.replace(/^[^:：]+[:：]\s*/, ''));
   }
 
   function absoluteUrl(value) {
@@ -87,8 +89,12 @@
 
   function packageOrders(doc, fallbackOrder) {
     const explicit = [...packageOrderLinks(doc).keys()];
-    // If the page does not expose detail links, retain IDs visible on this package page only.
-    return unique([...explicit, ...orderIds(doc.body?.innerText || ''), fallbackOrder]);
+    // 页面全文可能包含推荐或历史订单；详情链接是唯一高置信度来源。
+    // 无显式链接时仅使用发起订单卡的回退值，并强制标为待复核。
+    return explicit.length ? { ids: explicit, confidence: '已确认' } : {
+      ids: fallbackOrder ? [fallbackOrder] : [],
+      confidence: '待复核'
+    };
   }
 
   function asinFromElement(element) {
@@ -172,30 +178,56 @@
     return { amount: total, state: '已确认', matched };
   }
 
+  function loadSubmissionState() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch (_) { return {}; }
+  }
+
+  function saveSubmissionState(value) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(value)); } catch (_) { /* Storage unavailable. */ }
+  }
+
+  function csvCell(value) {
+    return `"${String(value ?? '').replace(/"/g, '""')}"`;
+  }
+
+  function downloadCsv(rows) {
+    const header = ['tracking_number', 'order_ids', 'amount_usd', 'amount_state', 'order_state', 'submission_state'];
+    const body = rows.map(row => [row.tracking, row.orders.join(','), row.state === '已确认' ? row.amount.toFixed(2) : '', row.state, row.orderConfidence, row.submissionState].map(csvCell).join(',')).join('\r\n');
+    const url = URL.createObjectURL(new Blob([`\uFEFF${header.join(',')}\r\n${body}`], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url; link.download = `amazon-tracking-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   async function runExtraction() {
     const button = document.getElementById(BUTTON_ID);
     button.disabled = true;
     button.textContent = '正在读取物流页…';
     const byTracking = new Map();
     let visited = 0;
+    const errors = [];
     for (const link of packageLinks()) {
       try {
         const doc = await fetchDocument(link.url);
         visited += 1;
         const tracking = trackingFromDeliveryCard(doc);
         if (!tracking) continue;
-        const orders = packageOrders(doc, link.fallbackOrder);
-        const value = await resolveAmount(doc, orders);
+        const orderResult = packageOrders(doc, link.fallbackOrder);
+        const value = await resolveAmount(doc, orderResult.ids);
         const old = byTracking.get(tracking);
         byTracking.set(tracking, {
           tracking,
-          orders: unique([...(old?.orders || []), ...orders]),
+          orders: unique([...(old?.orders || []), ...orderResult.ids]),
+          orderConfidence: old?.orderConfidence === '待复核' || orderResult.confidence === '待复核' ? '待复核' : '已确认',
           amount: old?.state === '待识别' || value.state === '待识别' ? null : value.amount,
           state: old?.state === '待识别' || value.state === '待识别' ? '待识别' : value.state
         });
-      } catch (_) { /* Continue with other packages. */ }
+      } catch (error) {
+        errors.push(error?.message || '读取或解析失败');
+      }
     }
-    showPanel([...byTracking.values()], `已读取 ${visited} 个物流页面；仅显示从 .pt-delivery-card-trackingId 读取到的单号。`);
+    showPanel([...byTracking.values()], { visited, errors });
     button.disabled = false;
     button.textContent = '重新提取物流号';
   }
@@ -206,16 +238,48 @@
     });
   }
 
-  function showPanel(rows, status) {
+  function showPanel(rows, summary) {
     let panel = document.getElementById(PANEL_ID);
     if (!panel) { panel = document.createElement('div'); panel.id = PANEL_ID; document.body.append(panel); }
-    Object.assign(panel.style, { position: 'fixed', top: '60px', right: '18px', width: 'min(760px,94vw)', maxHeight: '82vh', overflow: 'auto', zIndex: 999999, background: '#fff', color: '#111', padding: '14px', border: '1px solid #aaa', borderRadius: '8px', font: '13px Arial,sans-serif' });
-    const numbers = rows.map(row => row.tracking).join('\n');
-    const lines = rows.map(row => `${row.tracking}\t${row.state === '已确认' ? `$${row.amount.toFixed(2)}` : '待识别'}\t${row.orders.join(', ')}`).join('\n');
-    panel.innerHTML = `<div style="display:flex;justify-content:space-between"><strong>Amazon 物流号与包裹商品金额</strong><button id="${PANEL_ID}-close">关闭</button></div><p>${status}</p><p><b>物流单号</b> <button id="${PANEL_ID}-copy-numbers">复制</button></p><textarea readonly style="width:100%;height:100px">${numbers}</textarea><p><b>物流号、商品金额、关联订单</b> <button id="${PANEL_ID}-copy-table">复制</button></p><textarea readonly style="width:100%;height:150px">${lines}</textarea><p style="color:#666">“待识别”表示无法唯一匹配包裹商品与订单商品，或没有明确的商品单价；脚本不会以订单总金额代替。</p>`;
-    panel.querySelector(`#${PANEL_ID}-close`).onclick = () => panel.remove();
-    panel.querySelector(`#${PANEL_ID}-copy-numbers`).onclick = () => copy(numbers);
-    panel.querySelector(`#${PANEL_ID}-copy-table`).onclick = () => copy(lines);
+    Object.assign(panel.style, { position: 'fixed', top: '60px', right: '18px', width: 'min(920px,94vw)', maxHeight: '82vh', overflow: 'auto', zIndex: 999999, background: '#fff', color: '#111', padding: '14px', border: '1px solid #aaa', borderRadius: '8px', font: '13px Arial,sans-serif' });
+    const saved = loadSubmissionState();
+    const selected = new Set(rows.map(row => row.tracking));
+    const make = (tag, value) => { const element = document.createElement(tag); if (value !== undefined) element.textContent = value; return element; };
+    let query = '';
+
+    const render = () => {
+      const visible = rows.filter(row => !query || `${row.tracking} ${row.orders.join(' ')}`.toUpperCase().includes(query));
+      const selectedRows = () => visible.filter(row => selected.has(row.tracking)).map(row => ({ ...row, submissionState: saved[row.tracking]?.status || '待报单' }));
+      panel.replaceChildren();
+      const header = make('div'); Object.assign(header.style, { display: 'flex', justifyContent: 'space-between', alignItems: 'center' });
+      const close = make('button', '关闭'); close.onclick = () => panel.remove(); header.append(make('strong', 'Amazon 物流工作台'), close); panel.append(header);
+      panel.append(make('p', `已读取 ${summary.visited} 个物流页面，识别 ${rows.length} 个单号；异常 ${summary.errors.length} 个。`));
+      const warning = make('p', '仅从 .pt-delivery-card-trackingId 读取单号。“待复核”表示只能从订单卡回退关联；“已报单（本地）”不是平台成功回执。'); warning.style.color = '#8a4b00'; panel.append(warning);
+      const controls = make('div'); Object.assign(controls.style, { display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' });
+      const filter = document.createElement('input'); filter.placeholder = '筛选物流号或订单号'; filter.value = query; filter.oninput = () => { query = filter.value.trim().toUpperCase(); render(); };
+      const copyNumbers = make('button', '复制单号'); copyNumbers.onclick = () => copy(selectedRows().map(row => row.tracking).join('\n'));
+      const copyTable = make('button', '复制 TSV'); copyTable.onclick = () => copy(selectedRows().map(row => `${row.tracking}\t${row.state === '已确认' ? `$${row.amount.toFixed(2)}` : '待识别'}\t${row.orders.join(',')}\t${row.orderConfidence}\t${row.submissionState}`).join('\n'));
+      const exportCsv = make('button', '导出 CSV'); exportCsv.onclick = () => downloadCsv(selectedRows());
+      controls.append(filter, copyNumbers, copyTable, exportCsv); panel.append(controls);
+      const table = make('table'); Object.assign(table.style, { width: '100%', borderCollapse: 'collapse' });
+      const head = make('thead'); const headRow = make('tr'); const all = document.createElement('input'); all.type = 'checkbox'; all.checked = visible.length > 0 && visible.every(row => selected.has(row.tracking));
+      all.onchange = () => { visible.forEach(row => all.checked ? selected.add(row.tracking) : selected.delete(row.tracking)); render(); };
+      const allCell = make('th'); allCell.append(all); headRow.append(allCell); ['物流号', '关联订单', '商品金额', '订单关联', '报单状态'].forEach(label => headRow.append(make('th', label))); head.append(headRow); table.append(head);
+      const body = make('tbody');
+      for (const row of visible) {
+        const tr = make('tr'); tr.style.borderTop = '1px solid #ddd';
+        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(row.tracking); checkbox.onchange = () => checkbox.checked ? selected.add(row.tracking) : selected.delete(row.tracking);
+        const choice = make('td'); choice.append(checkbox); tr.append(choice, make('td', row.tracking), make('td', row.orders.join(', ') || '未找到'), make('td', row.state === '已确认' ? `$${row.amount.toFixed(2)}` : '待识别'));
+        const confidence = make('td', row.orderConfidence); if (row.orderConfidence === '待复核') confidence.style.color = '#8a4b00'; tr.append(confidence);
+        const statusCell = make('td'); statusCell.append(make('span', saved[row.tracking]?.status || '待报单'), document.createElement('br'));
+        const mark = make('button', saved[row.tracking]?.status === '已报单（本地）' ? '标为待报单' : '标为已报单（本地）');
+        mark.onclick = () => { saved[row.tracking] = { status: saved[row.tracking]?.status === '已报单（本地）' ? '待报单' : '已报单（本地）', updatedAt: new Date().toISOString() }; saveSubmissionState(saved); render(); };
+        statusCell.append(mark); tr.append(statusCell); body.append(tr);
+      }
+      table.append(body); panel.append(table);
+      if (summary.errors.length) { const details = make('details'); details.append(make('summary', `读取异常（${summary.errors.length}）`)); summary.errors.forEach(error => details.append(make('div', error))); panel.append(details); }
+    };
+    render();
   }
 
   function addButton() {
