@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.2.1
+// @version      1.2.2
 // @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
@@ -18,7 +18,7 @@
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
   const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
-  const SCRIPT_VERSION = '1.2.1';
+  const SCRIPT_VERSION = '1.2.2';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -201,15 +201,20 @@
   function readItems(scope, orderId) {
     const found = [], seen = new Map();
     for (const image of scope.querySelectorAll('img')) {
-      const container = image.closest('[data-asin], li, .a-box, .a-section, div') || image.parentElement;
-      const key = imageKey(image), asin = asinFromElement(container) || asinFromElement(image.closest('a'));
-      if (!asin && !key) continue;
+      const productLink = image.closest('a[href*="/dp/"],a[href*="/gp/product/"]') || image.closest('[data-asin]')?.querySelector('a[href*="/dp/"],a[href*="/gp/product/"]');
+      const directAsin = image.closest('[data-asin]')?.getAttribute('data-asin') || '';
+      // Decorative images, badges and recommendation thumbnails have neither a product link
+      // nor a valid ASIN. Never turn them into package items.
+      if (!productLink && !/^[A-Z0-9]{10}$/i.test(directAsin)) continue;
+      const container = productLink?.closest('[data-asin], li, .a-box, .a-section') || image.closest('[data-asin]') || productLink?.parentElement;
+      const key = imageKey(image), asin = asinFromElement(container) || asinFromElement(productLink);
+      if (!asin && !productLink) continue;
       const identity = asin ? `asin:${asin}` : `image:${key}`;
       // Repeated thumbnails in one item container do not represent extra units.
       const containers = seen.get(identity) || new Set();
       if (containers.has(container)) continue;
       containers.add(container); seen.set(identity, containers);
-      found.push({ asin, key, identity, name: itemName(image, container), quantity: itemQuantity(container),
+      found.push({ asin, key, identity, name: text(productLink?.getAttribute('title') || productLink?.textContent || itemName(image, container)), quantity: itemQuantity(container),
         price: orderId ? amountFromItem(container) : null, orderId });
     }
     return found;
@@ -229,7 +234,10 @@
     const original = text(value).normalize('NFKC');
     if (!original) return '';
     // Recognize device titles conservatively; accessories mentioning a device keep their names.
-    if (!/^(?:(?:Apple\s+)?(?:\d{4}\s+)?(?:iPad|iPhone|MacBook)|Samsung\s+Galaxy|Google\s+Pixel|Microsoft\s+Surface|Nintendo\s+Switch|Sony\s+PlayStation)\b/i.test(original)) return original;
+    if (!/^(?:(?:Apple\s+)?(?:\d{4}\s+)?(?:iPad|iPhone|MacBook|Mac\s+mini)|Samsung\s+Galaxy|Google\s+Pixel|Microsoft\s+Surface|Nintendo\s+Switch|Sony\s+PlayStation)\b/i.test(original)) {
+      const concise = text(original.split(/[:：|]/)[0]);
+      return concise.length > 48 ? `${concise.slice(0, 47)}…` : concise;
+    }
     // Stable short forms for common Apple device titles. Marketing text, colour, storage and chip
     // details are intentionally excluded so that identical models group into a concise report row.
     if (/\biPad Air\b/i.test(original)) {
@@ -239,6 +247,10 @@
     if (/\bMacBook Air\b/i.test(original)) {
       const size = original.match(/\b(13|15)(?:\.\d+)?-inch\b/i)?.[1];
       return size ? `MacBook Air ${size}` : 'MacBook Air';
+    }
+    if (/\bMac\s+mini\b/i.test(original)) {
+      const chip = original.match(/\bM\d+\b/i)?.[0]?.toUpperCase();
+      return chip ? `Mac mini ${chip}` : 'Mac mini';
     }
     let name = original.split(/[:：;]/)[0].replace(/^Apple\s+/i, '');
     name = name.replace(/\b\d+(?:\.\d+)?\s*(?:TB|GB)\b/gi, '')
