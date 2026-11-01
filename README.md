@@ -1,5 +1,13 @@
 # Amazon Tracking Assistant
 
+### 1.2.5 调试版本
+
+修正数量徽标、ASIN 被当作商品名的问题；名称优先来自商品图片描述，缺少明确数量时显示 `?`。包裹范围和数量徽标结构仍需真实页面诊断验证，不能视为已完成验收。
+
+重新提取后点击“复制诊断报告”，报告增加逐页祖先节点计数、名称来源类型、明确数量与数字徽标线索，不输出页面 HTML、商品名、URL、订单号或物流号。窗口标题显示版本号，可确认是否更新成功。
+
+回归测试：`node tests/item-parsing.test.js` 直接运行脚本内的实际解析函数；`node tests/critical-parsing.test.js` 是历史规则测试。
+
 Tampermonkey userscript for Amazon US order history. It reads every package page linked from the loaded order cards and presents:
 
 - tracking numbers read exactly from `.pt-delivery-card-trackingId`;

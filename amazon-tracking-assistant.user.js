@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.2.4
+// @version      1.2.5
 // @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
@@ -18,7 +18,7 @@
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
   const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
-  const SCRIPT_VERSION = '1.2.4';
+  const SCRIPT_VERSION = '1.2.5';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -189,13 +189,22 @@
     return (source.match(/\/images\/I\/([^._/]+)/i) || [])[1]?.toLowerCase() || '';
   }
 
+  function validItemName(value) {
+    const name = text(value);
+    return name && !/^\d+$/.test(name) && !/^[A-Z0-9]{10}$/i.test(name) &&
+      !/^(?:qty|quantity|数量|數量)\s*[:：]?\s*\d+$/i.test(name) &&
+      !/^(?:Climate Pledge Friendly|product image|商品图片)$/i.test(name) ? name : '';
+  }
   function itemName(image, container) {
-    const link = container?.querySelector('a[href*="/dp/"], a[href*="/gp/product/"]');
-    return text(link?.getAttribute('title') || link?.textContent || image.getAttribute('alt') || image.getAttribute('title'));
+    const link = image.closest('a[href*="/dp/"],a[href*="/gp/product/"]');
+    // Image-link text can be only a quantity badge or an ASIN. Prefer descriptive attributes.
+    return [image.getAttribute('alt'), image.getAttribute('title'),
+      link?.getAttribute('title'), link?.getAttribute('aria-label'), link?.textContent]
+      .map(validItemName).find(Boolean) || '';
   }
   function itemQuantity(container) {
     const match = text(container?.textContent).match(/(?:qty|quantity|数量|數量)\s*[:：]?\s*(\d+)/i);
-    const value = match ? Number(match[1]) : 1;
+    const value = match ? Number(match[1]) : null;
     return Number.isSafeInteger(value) && value > 0 ? value : null;
   }
   function readItems(scope, orderId) {
@@ -206,14 +215,14 @@
       const productLink = image.closest('a[href*="/dp/"],a[href*="/gp/product/"]');
       if (!productLink) continue;
       const container = productLink.closest('[data-asin], li, .a-box, .a-section') || productLink.parentElement;
-      const key = imageKey(image), asin = asinFromElement(container) || asinFromElement(productLink);
+      const key = imageKey(image), asin = asinFromElement(productLink);
       if (!asin && !productLink) continue;
       const identity = asin ? `asin:${asin}` : `image:${key}`;
       // Repeated thumbnails in one item container do not represent extra units.
       const containers = seen.get(identity) || new Set();
       if (containers.has(container)) continue;
       containers.add(container); seen.set(identity, containers);
-      found.push({ asin, key, identity, name: text(productLink?.getAttribute('title') || productLink?.textContent || itemName(image, container)), quantity: itemQuantity(container),
+      found.push({ asin, key, identity, name: itemName(image, container), quantity: itemQuantity(container),
         price: orderId ? amountFromItem(container) : null, orderId });
     }
     return found;
@@ -230,6 +239,35 @@
       if (cardCount === 1 && hasProduct) return readItems(node);
     }
     return [];
+  }
+
+  function itemDiagnostics(doc) {
+    const fields = doc.querySelectorAll('.pt-delivery-card-trackingId');
+    const ancestors = [];
+    for (let node = fields[0]?.parentElement; node && node !== doc.body && ancestors.length < 12; node = node.parentElement) {
+      ancestors.push({ tag: node.tagName, trackingFields: node.querySelectorAll('.pt-delivery-card-trackingId').length,
+        images: node.querySelectorAll('img').length,
+        productLinks: node.querySelectorAll('a[href*="/dp/"],a[href*="/gp/product/"]').length });
+    }
+    const items = packageItems(doc);
+    return { trackingFields: fields.length, ancestors, items: items.map((item, index) => ({
+      index: index + 1, hasName: !!item.name, quantity: item.quantity, hasAsin: !!item.asin
+    })), imageLinks: [...doc.querySelectorAll('a[href*="/dp/"],a[href*="/gp/product/"]')]
+      .filter(link => link.querySelector('img')).slice(0, 40).map(link => {
+        const image = link.querySelector('img');
+        const classify = value => !text(value) ? 'empty' : /^\d+$/.test(text(value)) ? 'number' :
+          /^[A-Z0-9]{10}$/i.test(text(value)) ? 'asin' : validItemName(value) ? 'description' : 'rejected';
+        return { alt: classify(image.getAttribute('alt')), title: classify(link.getAttribute('title')),
+          linkText: classify(link.textContent), ancestors: (() => {
+            const result = [];
+            for (let node = link.parentElement; node && node !== doc.body && result.length < 4; node = node.parentElement) {
+              result.push({ tag: node.tagName, images: node.querySelectorAll('img').length,
+                explicitQuantity: itemQuantity(node), numericSpans: [...node.querySelectorAll('span')]
+                  .map(span => text(span.textContent)).filter(value => /^\d{1,3}$/.test(value)).slice(0, 8) });
+            }
+            return result;
+          })() };
+      }) };
   }
   function amountFromItem(container) {
     // Explicit USD item UNIT price only. Never use tax, shipping or order totals.
@@ -374,10 +412,12 @@
     let visited = 0;
     let missingTrackingField = 0;
     const errors = [];
+    const diagnostics = [];
     for (const link of links) {
       try {
         const doc = await fetchDocument(link.url);
         visited += 1;
+        diagnostics.push({ page: visited, ...itemDiagnostics(doc) });
         const tracking = trackingFromDeliveryCard(doc);
         if (!tracking) { missingTrackingField += 1; continue; }
         const orderResult = packageOrders(doc, link.fallbackOrder);
@@ -394,6 +434,7 @@
       visited,
       missingTrackingField,
       errors,
+      diagnostics,
       orderCards: findOrderCards().length
     });
     button.disabled = false;
@@ -425,7 +466,7 @@
       }
       languages.onchange = () => setLanguage(languages.value); languageLabel.append(languages);
       const close = make('button', t('close')); close.onclick = () => { refreshPanel = null; panel.remove(); };
-      header.append(make('strong', t('title')), languageLabel, close); panel.append(header);
+      header.append(make('strong', `${t('title')} ${SCRIPT_VERSION}`), languageLabel, close); panel.append(header);
       panel.append(make('p', t('overview', { visited: summary.visited, count: rows.length, errors: summary.errors.length })));
       const warning = make('p', t('warning')); warning.style.color = '#8a4b00'; panel.append(warning, make('p', t('groupingHelp')), make('p', t('amountHelp')));
       const controls = make('div'); Object.assign(controls.style, { display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' });
@@ -440,7 +481,8 @@
         `${t('diagPath')}: ${location.pathname}`,
         `${t('diagCards')}: ${summary.orderCards}`, `${t('diagLinks')}: ${summary.candidateLinks}`,
         `${t('diagVisited')}: ${summary.visited}`, `${t('diagFound')}: ${rows.length}`,
-        `${t('diagMissing')}: ${summary.missingTrackingField}`, `${t('diagErrors')}: ${summary.errors.length}`, t('diagPolicy')
+        `${t('diagMissing')}: ${summary.missingTrackingField}`, `${t('diagErrors')}: ${summary.errors.length}`, t('diagPolicy'),
+        'Item structure (no names, URLs, order IDs or tracking numbers):', JSON.stringify(summary.diagnostics)
       ].join('\n'));
       controls.append(filter, copyNumbers, copyTable, exportCsv, diagnostic); panel.append(controls);
       const table = make('table'); Object.assign(table.style, { width: '100%', minWidth: '980px', borderCollapse: 'collapse', textAlign: 'left' });
