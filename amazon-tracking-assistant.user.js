@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.2.3
+// @version      1.2.4
 // @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
@@ -18,7 +18,7 @@
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
   const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
-  const SCRIPT_VERSION = '1.2.3';
+  const SCRIPT_VERSION = '1.2.4';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -201,12 +201,11 @@
   function readItems(scope, orderId) {
     const found = [], seen = new Map();
     for (const image of scope.querySelectorAll('img')) {
-      const productLink = image.closest('a[href*="/dp/"],a[href*="/gp/product/"]') || image.closest('[data-asin]')?.querySelector('a[href*="/dp/"],a[href*="/gp/product/"]');
-      const directAsin = image.closest('[data-asin]')?.getAttribute('data-asin') || '';
-      // Decorative images, badges and recommendation thumbnails have neither a product link
-      // nor a valid ASIN. Never turn them into package items.
-      if (!productLink && !/^[A-Z0-9]{10}$/i.test(directAsin)) continue;
-      const container = productLink?.closest('[data-asin], li, .a-box, .a-section') || image.closest('[data-asin]') || productLink?.parentElement;
+      // Product images must be inside their own Amazon product link. This excludes badges,
+      // recommendation art and other decorative images from the package card.
+      const productLink = image.closest('a[href*="/dp/"],a[href*="/gp/product/"]');
+      if (!productLink) continue;
+      const container = productLink.closest('[data-asin], li, .a-box, .a-section') || productLink.parentElement;
       const key = imageKey(image), asin = asinFromElement(container) || asinFromElement(productLink);
       if (!asin && !productLink) continue;
       const identity = asin ? `asin:${asin}` : `image:${key}`;
@@ -221,9 +220,16 @@
   }
   function packageItems(doc) {
     const trackingField = doc.querySelector('.pt-delivery-card-trackingId');
-    // Never fall back to doc.body: that merges recommendations and other package cards into this shipment.
-    const scope = trackingField?.closest('.pt-delivery-card') || doc.querySelector('.pt-delivery-card');
-    return scope ? readItems(scope) : [];
+    if (!trackingField) return [];
+    // Amazon varies the enclosing card class. Find the smallest ancestor that contains an
+    // actual product link, but reject ancestors containing multiple tracking cards. Never
+    // use doc.body, otherwise recommendations and neighbouring packages leak into this row.
+    for (let node = trackingField.parentElement; node && node !== doc.body; node = node.parentElement) {
+      const cardCount = node.querySelectorAll('.pt-delivery-card-trackingId').length;
+      const hasProduct = node.querySelector('a[href*="/dp/"],a[href*="/gp/product/"]');
+      if (cardCount === 1 && hasProduct) return readItems(node);
+    }
+    return [];
   }
   function amountFromItem(container) {
     // Explicit USD item UNIT price only. Never use tax, shipping or order totals.
