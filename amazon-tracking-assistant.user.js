@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.1.1
+// @version      1.1.2
 // @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
@@ -18,7 +18,7 @@
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
   const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
-  const SCRIPT_VERSION = '1.1.1';
+  const SCRIPT_VERSION = '1.1.2';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -110,6 +110,20 @@
     return (source.match(/\/images\/I\/([^._/]+)/i) || [])[1]?.toLowerCase() || '';
   }
 
+  function compactProductName(value) {
+    const title = text(value);
+    if (!title) return '待识别';
+    if (/\biPad Air\b/i.test(title)) {
+      const chip = title.match(/\bM\d+\b/i)?.[0]?.toUpperCase();
+      return chip ? `iPad Air ${chip}` : 'iPad Air';
+    }
+    if (/\bMacBook Air\b/i.test(title)) {
+      const size = title.match(/\b(\d{2})(?:\.\d+)?-inch\b/i)?.[1];
+      return size ? `MacBook Air ${size}` : 'MacBook Air';
+    }
+    return title.length > 36 ? `${title.slice(0, 35)}…` : title;
+  }
+
   function packageItems(doc) {
     const scope = doc.querySelector('.pt-delivery-card') || doc.body;
     const items = new Map();
@@ -121,7 +135,9 @@
       const nearby = text(container?.innerText);
       const quantity = Number((nearby.match(/(?:qty|quantity)\s*:?\s*(\d+)/i) || [])[1] || 1);
       const identity = asin ? `asin:${asin}` : `image:${key}`;
-      if (!items.has(identity)) items.set(identity, { asin, key, quantity });
+      const productLink = container?.querySelector?.('a[href*="/dp/"],a[href*="/gp/product/"]');
+      const title = compactProductName(productLink?.innerText || productLink?.getAttribute('aria-label') || '');
+      if (!items.has(identity)) items.set(identity, { asin, key, quantity, title });
     }
     return [...items.values()];
   }
@@ -191,9 +207,23 @@
     return `"${String(value ?? '').replace(/"/g, '""')}"`;
   }
 
+  function itemSummary(items) {
+    return items.map(item => `${item.title || '待识别'} ×${item.quantity}`).join('；');
+  }
+
+  function mergeItems(first, second) {
+    const merged = new Map();
+    for (const item of [...(first || []), ...(second || [])]) {
+      const identity = item.asin ? `asin:${item.asin}` : item.key ? `image:${item.key}` : `title:${item.title}`;
+      const old = merged.get(identity);
+      merged.set(identity, old ? { ...old, quantity: Math.max(old.quantity, item.quantity) } : item);
+    }
+    return [...merged.values()];
+  }
+
   function downloadCsv(rows) {
-    const header = ['tracking_number', 'order_ids', 'amount_usd', 'amount_state', 'order_state', 'submission_state'];
-    const body = rows.map(row => [row.tracking, row.orders.join(','), row.state === '已确认' ? row.amount.toFixed(2) : '', row.state, row.orderConfidence, row.submissionState].map(csvCell).join(',')).join('\r\n');
+    const header = ['tracking_number', 'items', 'order_ids', 'amount_usd', 'amount_state', 'order_state', 'submission_state'];
+    const body = rows.map(row => [row.tracking, itemSummary(row.items || []), row.orders.join(','), row.state === '已确认' ? row.amount.toFixed(2) : '', row.state, row.orderConfidence, row.submissionState].map(csvCell).join(',')).join('\r\n');
     const url = URL.createObjectURL(new Blob([`\uFEFF${header.join(',')}\r\n${body}`], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a');
     link.href = url; link.download = `amazon-tracking-${new Date().toISOString().slice(0, 10)}.csv`;
@@ -217,10 +247,12 @@
         const tracking = trackingFromDeliveryCard(doc);
         if (!tracking) { missingTrackingField += 1; continue; }
         const orderResult = packageOrders(doc, link.fallbackOrder);
+        const products = packageItems(doc);
         const value = await resolveAmount(doc, orderResult.ids);
         const old = byTracking.get(tracking);
         byTracking.set(tracking, {
           tracking,
+          items: mergeItems(old?.items, products),
           orders: unique([...(old?.orders || []), ...orderResult.ids]),
           orderConfidence: old?.orderConfidence === '待复核' || orderResult.confidence === '待复核' ? '待复核' : '已确认',
           amount: old?.state === '待识别' || value.state === '待识别' ? null : value.amount,
@@ -267,7 +299,7 @@
       const controls = make('div'); Object.assign(controls.style, { display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' });
       const filter = document.createElement('input'); filter.placeholder = '筛选物流号或订单号'; filter.value = query; filter.oninput = () => { query = filter.value.trim().toUpperCase(); render(); };
       const copyNumbers = make('button', '复制单号'); copyNumbers.onclick = () => copy(selectedRows().map(row => row.tracking).join('\n'));
-      const copyTable = make('button', '复制 TSV'); copyTable.onclick = () => copy(selectedRows().map(row => `${row.tracking}\t${row.state === '已确认' ? `$${row.amount.toFixed(2)}` : '待识别'}\t${row.orders.join(',')}\t${row.orderConfidence}\t${row.submissionState}`).join('\n'));
+      const copyTable = make('button', '复制 TSV'); copyTable.onclick = () => copy(selectedRows().map(row => `${row.tracking}\t${itemSummary(row.items || [])}\t${row.state === '已确认' ? `$${row.amount.toFixed(2)}` : '待识别'}\t${row.orders.join(',')}\t${row.orderConfidence}\t${row.submissionState}`).join('\n'));
       const exportCsv = make('button', '导出 CSV'); exportCsv.onclick = () => downloadCsv(selectedRows());
       const diagnostic = make('button', '复制诊断报告');
       diagnostic.onclick = () => copy([
@@ -285,12 +317,12 @@
       const table = make('table'); Object.assign(table.style, { width: '100%', borderCollapse: 'collapse' });
       const head = make('thead'); const headRow = make('tr'); const all = document.createElement('input'); all.type = 'checkbox'; all.checked = visible.length > 0 && visible.every(row => selected.has(row.tracking));
       all.onchange = () => { visible.forEach(row => all.checked ? selected.add(row.tracking) : selected.delete(row.tracking)); render(); };
-      const allCell = make('th'); allCell.append(all); headRow.append(allCell); ['物流号', '关联订单', '商品金额', '订单关联', '报单状态'].forEach(label => headRow.append(make('th', label))); head.append(headRow); table.append(head);
+      const allCell = make('th'); allCell.append(all); headRow.append(allCell); ['物流号', '物品', '关联订单', '商品金额', '订单关联', '报单状态'].forEach(label => headRow.append(make('th', label))); head.append(headRow); table.append(head);
       const body = make('tbody');
       for (const row of visible) {
         const tr = make('tr'); tr.style.borderTop = '1px solid #ddd';
         const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(row.tracking); checkbox.onchange = () => checkbox.checked ? selected.add(row.tracking) : selected.delete(row.tracking);
-        const choice = make('td'); choice.append(checkbox); tr.append(choice, make('td', row.tracking), make('td', row.orders.join(', ') || '未找到'), make('td', row.state === '已确认' ? `$${row.amount.toFixed(2)}` : '待识别'));
+        const choice = make('td'); choice.append(checkbox); tr.append(choice, make('td', row.tracking), make('td', itemSummary(row.items || [])), make('td', row.orders.join(', ') || '未找到'), make('td', row.state === '已确认' ? `$${row.amount.toFixed(2)}` : '待识别'));
         const confidence = make('td', row.orderConfidence); if (row.orderConfidence === '待复核') confidence.style.color = '#8a4b00'; tr.append(confidence);
         const statusCell = make('td'); statusCell.append(make('span', saved[row.tracking]?.status || '待报单'), document.createElement('br'));
         const mark = make('button', saved[row.tracking]?.status === '已报单（本地）' ? '标为待报单' : '标为已报单（本地）');
