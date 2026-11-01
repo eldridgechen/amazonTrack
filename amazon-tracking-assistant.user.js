@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.2.0
+// @version      1.2.1
 // @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
@@ -18,7 +18,7 @@
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
   const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
-  const SCRIPT_VERSION = '1.2.0';
+  const SCRIPT_VERSION = '1.2.1';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -229,7 +229,17 @@
     const original = text(value).normalize('NFKC');
     if (!original) return '';
     // Recognize device titles conservatively; accessories mentioning a device keep their names.
-    if (!/^(?:(?:Apple\s+)?(?:iPad|iPhone|MacBook)|Samsung\s+Galaxy|Google\s+Pixel|Microsoft\s+Surface|Nintendo\s+Switch|Sony\s+PlayStation)\b/i.test(original)) return original;
+    if (!/^(?:(?:Apple\s+)?(?:\d{4}\s+)?(?:iPad|iPhone|MacBook)|Samsung\s+Galaxy|Google\s+Pixel|Microsoft\s+Surface|Nintendo\s+Switch|Sony\s+PlayStation)\b/i.test(original)) return original;
+    // Stable short forms for common Apple device titles. Marketing text, colour, storage and chip
+    // details are intentionally excluded so that identical models group into a concise report row.
+    if (/\biPad Air\b/i.test(original)) {
+      const chip = original.match(/\bM\d+\b/i)?.[0]?.toUpperCase();
+      return chip ? `iPad Air ${chip}` : 'iPad Air';
+    }
+    if (/\bMacBook Air\b/i.test(original)) {
+      const size = original.match(/\b(13|15)(?:\.\d+)?-inch\b/i)?.[1];
+      return size ? `MacBook Air ${size}` : 'MacBook Air';
+    }
     let name = original.split(/[:：;]/)[0].replace(/^Apple\s+/i, '');
     name = name.replace(/\b\d+(?:\.\d+)?\s*(?:TB|GB)\b/gi, '')
       .replace(/\b(?:space\s+gr[ae]y|space\s+black|rose\s+gold|starlight|silver|pink|blue|purple|yellow|gold|gray|grey|black|white)\b/gi, '')
