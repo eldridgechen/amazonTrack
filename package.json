@@ -1,0 +1,6 @@
+{
+  "name": "amazon-tracking-assistant",
+  "private": true,
+  "scripts": { "test": "node tests/critical-parsing.test.js && node tests/item-parsing.test.js", "check": "node --check amazon-tracking-assistant.user.js" },
+  "devDependencies": { "linkedom": "0.18.12" }
+}

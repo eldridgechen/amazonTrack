@@ -1,12 +1,16 @@
 # Amazon Tracking Assistant
 
-### 1.2.5 调试版本
+### 1.2.6 样例修复版（待真实页面复测）
 
-修正数量徽标、ASIN 被当作商品名的问题；名称优先来自商品图片描述，缺少明确数量时显示 `?`。包裹范围和数量徽标结构仍需真实页面诊断验证，不能视为已完成验收。
+根据用户提供的诊断结构，读取包裹 `OL > LI` 缩略图数量徽标，单件无徽标按 1 件处理；不读取列表外的推荐商品。保留同一 ASIN 的不同商品行，过滤同一行内重复图片。商品名从订单商品行补齐，新增 `iPad A16` 简称。
 
-重新提取后点击“复制诊断报告”，报告增加逐页祖先节点计数、名称来源类型、明确数量与数字徽标线索，不输出页面 HTML、商品名、URL、订单号或物流号。窗口标题显示版本号，可确认是否更新成功。
+订单单价从最小单商品购买行读取，不使用订单汇总金额。同 ASIN 跨订单且单价一致时可匹配；单价冲突、数量超出、缺价时仍显示待识别。合包样例的脱敏结构回归结果为 `iPad Air M4 ×3; MacBook Air 13 ×3; iPad A16 ×2`，金额 `$6,542.00`；同订单另一个包裹的商品不计入。
 
-回归测试：`node tests/item-parsing.test.js` 直接运行脚本内的实际解析函数；`node tests/critical-parsing.test.js` 是历史规则测试。
+这是截图与诊断驱动的修复，已通过合成 HTML 回归，尚未在用户登录页面完成端到端复测。订单详情 DOM 与样例结构不一致时可能仍待识别，不能视为全部真实页面已验收。
+
+重新提取后点击“复制诊断报告”，报告包含逐页祖先节点计数、名称来源类型、数量徽标线索，以及订单详情提取的商品数、数量和是否获得单价；不输出页面 HTML、商品名、URL、订单号或物流号。窗口标题显示版本号，可确认是否更新成功。
+
+回归测试：先运行 `npm ci`，再运行 `npm test` 和 `npm run check`。`tests/item-parsing.test.js` 直接运行脚本内的实际解析函数及合成 HTML；`tests/critical-parsing.test.js` 是历史规则测试。HTML 解析依赖只用于开发测试，不打包到油猴脚本。
 
 Tampermonkey userscript for Amazon US order history. It reads every package page linked from the loaded order cards and presents:
 

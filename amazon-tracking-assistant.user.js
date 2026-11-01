@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.2.5
+// @version      1.2.6
 // @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
@@ -18,7 +18,7 @@
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
   const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
-  const SCRIPT_VERSION = '1.2.5';
+  const SCRIPT_VERSION = '1.2.6';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -207,6 +207,19 @@
     const value = match ? Number(match[1]) : null;
     return Number.isSafeInteger(value) && value > 0 ? value : null;
   }
+  const PRODUCT_LINK = 'a[href*="/dp/"],a[href*="/gp/product/"]';
+  function thumbnailQuantity(link, tile) {
+    const explicit = itemQuantity(tile);
+    if (explicit !== null) return explicit;
+    // Observed package markup: OL > LI > product link, with an optional numeric badge.
+    // Never search the OL or arbitrary page spans (price decimals also look like badges).
+    const isPackageTile = tile?.tagName === 'LI' && tile.parentElement?.tagName === 'OL' &&
+      tile.querySelectorAll(PRODUCT_LINK).length === 1;
+    const label = text((isPackageTile ? tile : link)?.textContent);
+    if (/^[1-9]\d{0,2}$/.test(label)) return Number(label);
+    if (isPackageTile && !label) return 1;
+    return null;
+  }
   function readItems(scope, orderId) {
     const found = [], seen = new Map();
     for (const image of scope.querySelectorAll('img')) {
@@ -222,7 +235,7 @@
       const containers = seen.get(identity) || new Set();
       if (containers.has(container)) continue;
       containers.add(container); seen.set(identity, containers);
-      found.push({ asin, key, identity, name: itemName(image, container), quantity: itemQuantity(container),
+      found.push({ asin, key, identity, name: itemName(image, container), quantity: thumbnailQuantity(productLink, container),
         price: orderId ? amountFromItem(container) : null, orderId });
     }
     return found;
@@ -277,7 +290,41 @@
     const cents = Number(match[1].replace(/[, .]/g, ''));
     return Number.isSafeInteger(cents) ? cents / 100 : null;
   }
-  function orderItems(doc, orderId) { return readItems(doc.body, orderId); }
+  function orderItems(doc, orderId) {
+    const result = [], seen = new Set();
+    for (const link of doc.querySelectorAll(PRODUCT_LINK)) {
+      const image = link.querySelector('img'), asin = asinFromElement(link);
+      if (!image || !asin) continue;
+      // Find the smallest single-product purchase row. Stop before shipment/order totals,
+      // another thumbnail or recommendation blocks; title links alone are not extra items.
+      for (let row = link.parentElement; row && row !== doc.body; row = row.parentElement) {
+        const value = text(row.textContent);
+        const imageLinks = [...row.querySelectorAll(PRODUCT_LINK)].filter(a => a.querySelector('img'));
+        if (imageLinks.length !== 1 || /(?:subtotal|grand total|order summary|shipping\s*&\s*handling)/i.test(value)) break;
+        if (!/(?:sold by|return window|退货|銷售方|销售方)/i.test(value)) continue;
+        const titles = [...row.querySelectorAll(PRODUCT_LINK)].filter(a => asinFromElement(a) === asin)
+          .map(a => validItemName(a.textContent)).filter(Boolean);
+        const name = titles[0] || itemName(image, row);
+        const prices = [...value.matchAll(/(?:US\$|USD\s*\$?|\$)\s*([\d,]+\.\d{2})(?!\d)/g)];
+        if (!name || prices.length !== 1) continue;
+        if (seen.has(row)) break;
+        seen.add(row);
+        let quantity = itemQuantity(row) ?? thumbnailQuantity(link, link.parentElement);
+        // Quantity may be beside the anchor, in the image-only column. Do not inspect
+        // number spans from the text/price column or infer quantity from the order total.
+        for (let column = link.parentElement; quantity === null && column && column !== row; column = column.parentElement) {
+          const label = text(column.textContent);
+          if (/^[1-9]\d{0,2}$/.test(label)) quantity = Number(label);
+        }
+        if (quantity === null) quantity = 1; // Amazon purchase rows omit the badge for one unit.
+        const foreign = /(?:CAD|AUD|NZD|HKD|CNY|EUR|GBP)/i.test(value);
+        const price = foreign ? null : Number(prices[0][1].replace(/,/g, ''));
+        result.push({ asin, key: imageKey(image), identity: `asin:${asin}`, name, quantity, price, orderId });
+        break;
+      }
+    }
+    return result;
+  }
 
   function modelName(value) {
     const original = text(value).normalize('NFKC');
@@ -292,6 +339,9 @@
     if (/\biPad Air\b/i.test(original)) {
       const chip = original.match(/\bM\d+\b/i)?.[0]?.toUpperCase();
       return chip ? `iPad Air ${chip}` : 'iPad Air';
+    }
+    if (/\biPad\b/i.test(original) && /\bA\d+\s+chip\b/i.test(original)) {
+      return `iPad ${original.match(/\bA\d+(?=\s+chip\b)/i)[0].toUpperCase()}`;
     }
     if (/\bMacBook Air\b/i.test(original)) {
       const size = original.match(/\b(13|15)(?:\.\d+)?-inch\b/i)?.[1];
@@ -334,12 +384,17 @@
     const used = new Map();
     const items = packageProductList.map(pkg => {
       const candidates = products.filter(p => (pkg.asin && p.asin === pkg.asin) || (!pkg.asin && pkg.key && p.key === pkg.key));
-      const product = candidates.length === 1 ? candidates[0] : null;
+      // The same ASIN can occur in several constituent orders. Equal unit prices may be
+      // pooled; differing prices must remain unresolved, never averaged or picked first.
+      const priceSet = new Set(candidates.map(p => p.price));
+      const product = candidates.length && priceSet.size === 1 ? candidates[0] : null;
       const item = { ...pkg, name: pkg.name || product?.name || '', price: null };
       const validQty = Number.isSafeInteger(pkg.quantity) && pkg.quantity > 0;
-      const consumed = product ? (used.get(product) || 0) + (validQty ? pkg.quantity : 0) : 0;
-      if (product) used.set(product, consumed);
-      if (!product || !validQty || !Number.isSafeInteger(product.quantity) || consumed > product.quantity || !Number.isFinite(product.price) || product.price < 0) complete = false;
+      const identity = pkg.asin ? `asin:${pkg.asin}` : `image:${pkg.key}`;
+      const consumed = (used.get(identity) || 0) + (validQty ? pkg.quantity : 0);
+      used.set(identity, consumed);
+      const available = candidates.reduce((sum, p) => sum + (Number.isSafeInteger(p.quantity) && p.quantity > 0 ? p.quantity : NaN), 0);
+      if (!product || !validQty || !Number.isSafeInteger(available) || consumed > available || !Number.isFinite(product.price) || product.price < 0) complete = false;
       else { item.price = product.price; cents += Math.round(product.price * 100) * pkg.quantity; }
       return item;
     });
@@ -353,20 +408,28 @@
   }
   async function resolveAmount(doc) {
     const packages = packageItems(doc), products = [];
+    const orderDiagnostics = [];
     let failed = false;
     for (const [id, url] of packageOrderLinks(doc)) {
-      try { products.push(...orderItems(await fetchDocument(url), id)); } catch (_) { failed = true; }
+      try {
+        const orderDoc = await fetchDocument(url), parsed = orderItems(orderDoc, id);
+        products.push(...parsed);
+        orderDiagnostics.push({ itemCount: parsed.length, items: parsed.map(p => ({
+          hasName: !!p.name, quantity: p.quantity, hasPrice: Number.isFinite(p.price)
+        })), productImageLinks: [...orderDoc.querySelectorAll(PRODUCT_LINK)].filter(a => a.querySelector('img')).length });
+      } catch (_) { failed = true; orderDiagnostics.push({ failed: true }); }
     }
     const result = reconcileItems(packages, products);
-    if (failed) return { ...result, amount: null, state: '待识别' };
-    return result;
+    return { ...result, ...(failed ? { amount: null, state: '待识别' } : {}), orderDiagnostics };
   }
   function mergePackageRow(old, row) {
     if (!old) return row;
     // Same tracking page reached from multiple orders: do not double count snapshots.
     const fingerprint = r => JSON.stringify((r.items || []).map(i => [i.identity, i.quantity, i.price]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
     const agrees = fingerprint(old) === fingerprint(row) && old.state === row.state && old.amount === row.amount;
-    return { ...old, orders: unique([...old.orders, ...row.orders]),
+    const items = (old.items || []).map(item => ({ ...item, name: item.name ||
+      (row.items || []).find(other => other.identity === item.identity && other.quantity === item.quantity)?.name || '' }));
+    return { ...old, items, orders: unique([...old.orders, ...row.orders]),
       orderConfidence: old.orderConfidence === '待复核' || row.orderConfidence === '待复核' ? '待复核' : '已确认',
       state: agrees ? old.state : '待识别', amount: agrees ? old.amount : null,
       itemConflict: old.itemConflict || !agrees };
@@ -422,6 +485,7 @@
         if (!tracking) { missingTrackingField += 1; continue; }
         const orderResult = packageOrders(doc, link.fallbackOrder);
         const value = await resolveAmount(doc, orderResult.ids);
+        diagnostics[diagnostics.length - 1].orders = value.orderDiagnostics;
         byTracking.set(tracking, mergePackageRow(byTracking.get(tracking), {
           tracking, orders: orderResult.ids, orderConfidence: orderResult.confidence, ...value
         }));
