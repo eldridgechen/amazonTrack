@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon 物流号与包裹商品金额助手
 // @namespace    https://github.com/eldridgechen/amazonTrack
-// @version      1.2.2
+// @version      1.2.3
 // @description  从 Amazon 物流详情页精确读取运单号，提供本地复核、导出与报单状态工作台。
 // @match        https://www.amazon.com/your-orders/*
 // @match        https://www.amazon.com/gp/css/order-history*
@@ -18,7 +18,7 @@
   const BUTTON_ID = 'amazon-tracking-assistant-button';
   const PANEL_ID = 'amazon-tracking-assistant-panel';
   const STORAGE_KEY = 'amazon-tracking-assistant-submissions-v1';
-  const SCRIPT_VERSION = '1.2.2';
+  const SCRIPT_VERSION = '1.2.3';
   const ORDER_RE = /\b\d{3}-\d{7}-\d{7}\b/g;
 
   const text = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -219,7 +219,12 @@
     }
     return found;
   }
-  function packageItems(doc) { return readItems(doc.querySelector('.pt-delivery-card') || doc.body); }
+  function packageItems(doc) {
+    const trackingField = doc.querySelector('.pt-delivery-card-trackingId');
+    // Never fall back to doc.body: that merges recommendations and other package cards into this shipment.
+    const scope = trackingField?.closest('.pt-delivery-card') || doc.querySelector('.pt-delivery-card');
+    return scope ? readItems(scope) : [];
+  }
   function amountFromItem(container) {
     // Explicit USD item UNIT price only. Never use tax, shipping or order totals.
     const value = text(container?.textContent);
@@ -275,7 +280,10 @@
     return [...groups.values()];
   }
   function itemsSummary(items) {
-    return groupItems(items).map(g => `${g.name || t('unknown')} ×${g.uncertain ? '?' : g.quantity}`).join('; ') || t('unknown');
+    const groups = groupItems(items);
+    const visible = groups.slice(0, 4).map(g => `${g.name || t('unknown')} ×${g.uncertain ? '?' : g.quantity}`);
+    if (groups.length > 4) visible.push(`+${groups.length - 4}`);
+    return visible.join('; ') || t('unknown');
   }
   function reconcileItems(packageProductList, products) {
     let cents = 0, complete = packageProductList.length > 0;
